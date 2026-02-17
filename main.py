@@ -1,7 +1,4 @@
 import os
-import asyncio
-import time
-import random
 import re
 from collections import deque
 from telegram import Update
@@ -14,43 +11,25 @@ IA_EMAIL = os.getenv('IA_EMAIL')
 IA_KEY = os.getenv('IA_KEY')
 IA_SECRET = os.getenv('IA_SECRET')
 
-if all([TELEGRAM_TOKEN, IA_EMAIL, IA_KEY, IA_SECRET]):
-    configure(IA_EMAIL, IA_KEY, IA_SECRET)
-else:
-    print("Environment variables missing!")
-    exit(1)
-
+configure(IA_EMAIL, IA_KEY, IA_SECRET)
 upload_queue = deque()
-processing = False
 app = None
 
-async def send_status(chat_id, message):
+def send_status(chat_id, message):
     try:
-        await app.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+        asyncio.create_task(app.bot.send_message(chat_id=chat_id, text=message))
     except:
         pass
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = "🔥 Terabox → Archive.org Bot
+async def start(update, context):
+    await update.message.reply_text("Terabox Archive Bot. Send: link | title | category")
 
-*Single:* `link | title | category`
-
-*Multiple:*
-`/queue`
-`link1 | title1 | cat1`
-`link2 | title2 | cat2`"
-    await update.message.reply_text(msg, parse_mode='Markdown')
-
-async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global processing
+async def queue_command(update, context):
+    global app
     text = ' '.join(context.args)
     
-    if not text.strip():
-        msg = "❌ Links bhejiye `/queue` ke saath!
-
-`/queue`
-`https://terabox.com/xyz | Avengers | Movies`"
-        await update.message.reply_text(msg, parse_mode='Markdown')
+    if not text:
+        await update.message.reply_text("Send /queue with links")
         return
     
     lines = text.split('
@@ -59,27 +38,21 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     for i, line in enumerate(lines):
         line = line.strip()
-        if 'terabox' in line.lower() and '|' in line:
+        if 'terabox' in line and '|' in line:
             parts = [p.strip() for p in line.split('|')]
             queue_item = {
                 'link': parts[0],
-                'title': parts[1] if len(parts) > 1 else f'Untitled_{i+1}',
+                'title': parts[1] if len(parts) > 1 else f'Untitled_{i}',
                 'category': parts[2] if len(parts) > 2 else 'data',
                 'chat_id': update.effective_chat.id
             }
             upload_queue.append(queue_item)
             queued += 1
     
-    status = f"✅ {queued} links queued! Processing..."
-    await update.message.reply_text(status, parse_mode='Markdown')
-    
-    if not processing:
-        asyncio.create_task(process_queue())
+    await update.message.reply_text(f"Queued {queued} links")
+    process_queue()
 
-async def process_queue():
-    global processing
-    processing = True
-    
+def process_queue():
     total = len(upload_queue)
     current = 0
     
@@ -90,71 +63,61 @@ async def process_queue():
         
         try:
             unique_id = f"tba_{int(time.time())}_{random.randint(1000,9999)}"
-            output_template = f"{unique_id}.%(ext)s"
+            ydl_opts = {'outtmpl': f'{unique_id}.%(ext)s'}
             
-            status = f"⏳ {current}/{total}: {item['title']} - Downloading..."
-            await send_status(item['chat_id'], status)
+            send_status(item['chat_id'], f"{current}/{total}: Downloading {item['title']}")
             
-            ydl_opts = {
-                'outtmpl': output_template,
-                'format': 'best[height<=1080]',
-                'quiet': True
-            }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([item['link']])
             
             files = [f for f in os.listdir('.') if f.startswith(unique_id)]
-            if not files:
-                raise Exception("Download failed")
-            video_file = files[0]
-            
-            status = f"📤 {current}/{total}: {item['title']} - Uploading..."
-            await send_status(item['chat_id'], status)
-            
-            identifier = re.sub(r'[^w-]', '-', item['title'].lower())[:40]
-            if get_item(identifier).exists:
-                identifier += f"_{int(time.time())%10000}"
-            
-            files_to_upload = [(video_file, {
-                'title': item['title'],
-                'creator': 'Telegram User',
-                'collection': item['category']
-            })]
-            
-            metadata = {
-                'title': item['title'],
-                'description': f"Terabox-Archive Bot | {item['category']}",
-                'collection': item['category'],
-                'mediatype': 'movies'
-            }
-            
-            res = upload(identifier, files_to_upload, metadata=metadata, verbose=False)
-            
-            if res['status'] == 'ok':
-                ia_url = f"https://archive.org/details/{identifier}"
-                status = f"✅ {current}/{total} DONE!
-{ia_url}"
-                await send_status(item['chat_id'], status)
-            else:
-                raise Exception("Upload failed")
+            if files:
+                video_file = files[0]
                 
+                send_status(item['chat_id'], f"{current}/{total}: Uploading")
+                
+                identifier = re.sub(r'[^a-z0-9]', '-', item['title'].lower())[:40]
+                files_to_upload = [(video_file, {'title': item['title']})]
+                metadata = {'title': item['title'], 'mediatype': 'movies'}
+                
+                res = upload(identifier, files_to_upload, metadata=metadata)
+                
+                if res['status'] == 'ok':
+                    url = f"https://archive.org/details/{identifier}"
+                    send_status(item['chat_id'], f"DONE: {url}")
+            
         except Exception as e:
-            await send_status(item['chat_id'], f"❌ {current}/{total} Error: {str(e)[:100]}")
+            send_status(item['chat_id'], f"Error: {str(e)}")
         
         finally:
             if video_file and os.path.exists(video_file):
                 os.remove(video_file)
         
-        await asyncio.sleep(45)
-    
-    processing = False
+        time.sleep(30)
+
+async def handle_message(update, context):
+    text = update.message.text
+    if 'terabox' in text and '|' in text:
+        parts = [p.strip() for p in text.split('|')]
+        queue_item = {
+            'link': parts[0],
+            'title': parts[1] if len(parts) > 1 else 'Untitled',
+            'category': parts[2] if len(parts) > 2 else 'data',
+            'chat_id': update.effective_chat.id
+        }
+        upload_queue.append(queue_item)
+        await update.message.reply_text("Added to queue")
+        process_queue()
 
 def main():
     global app
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('queue', queue_command))
-    print("🚀 Bot LIVE!")
+    app.add_handler(MessageHandler(filters.TEXT, handle_message))
+    
+    print("Bot started")
     app.run_polling()
 
 if __name__ == '__main__':
